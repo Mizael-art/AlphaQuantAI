@@ -1,0 +1,24 @@
+# render.yaml
+# ============
+# Blueprint para deploy automático no Render (https://render.com).
+#
+# Como usar:
+# 1. Suba este projeto para um repositório no GitHub.
+# 2. No Render: New > Blueprint > selecione o repositório.
+# 3. O Render lê este arquivo e cria o serviço automaticamente.
+#
+# Alternativa manual (sem este arquivo):
+# New > Web Service > selecione o repo >
+#   Runtime: Docker (ele detecta o Dockerfile automaticamente)
+#   Ou, sem Docker: Build Command "pip install -r requirements.txt",
+#   Start Command "uvicorn server:app --host 0.0.0.0 --port $PORT"
+
+services:
+  - type: web
+    name: alphaquant-engine
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DEBUG_MODE
+        value: "false"
