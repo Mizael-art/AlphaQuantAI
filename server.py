@@ -27,12 +27,12 @@ do README (seção "Uso") e das assinaturas reais de
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app import InsufficientDataError, run_analysis
 from backtest.costs import CostModel
@@ -106,7 +106,7 @@ app = FastAPI(
         "derivativos e consenso multi-exchange (preço e estrutura), "
         "consumidos sem depender de prints de gráfico."
     ),
-    version="3.1",
+    version="3.2",
     servers=[{"url": "https://alphaquantai-1.onrender.com", "description": "Produção (Render)"}],
 )
 
@@ -210,6 +210,22 @@ class BacktestRequest(BaseModel):
     cost_model: BacktestCostModelRequest = Field(default_factory=BacktestCostModelRequest)
     min_candles: int = Field(default=50, description="Mínimo de candles exigido no range -- abaixo disso, erro em vez de rodar com amostra insuficiente.")
 
+    @field_validator("start", "end")
+    @classmethod
+    def _assume_utc_when_naive(cls, value: datetime | None) -> datetime | None:
+        """
+        O GPT frequentemente envia datas sem offset (ex.: "2026-07-01T00:00:00",
+        sem "Z" nem "+00:00"). Sem isso, essa data chega "naive" e quebra em
+        `TypeError: can't compare offset-naive and offset-aware datetimes`
+        assim que é comparada contra `Candle.open_time` (sempre UTC-aware) --
+        um 500 genérico, não um 422 com motivo. Todo dado de candle deste
+        projeto é UTC (ver `models/candle.py`), então assumir UTC para uma
+        data sem timezone é o comportamento correto, não uma adivinhação.
+        """
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
 
 @app.get("/backtest/strategies", response_model=BacktestStrategiesResponse)
 def get_backtest_strategies() -> BacktestStrategiesResponse:
@@ -240,14 +256,14 @@ def post_backtest(request: BacktestRequest) -> dict:
             end=request.end,
             min_candles=request.min_candles,
         )
-    except (HistoryFetchError, DataUnavailableError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (HistoryFetchError, DataUnavailableError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=f"Falha ao buscar histórico: {exc}") from exc
 
     simulator = BacktestSimulator(strategy=strategy, cost_model=cost_model)
     try:
         trades = simulator.run(history.candles)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=f"Falha ao simular estratégia: {exc}") from exc
 
     performance = calculate_performance(trades) if trades else None
 

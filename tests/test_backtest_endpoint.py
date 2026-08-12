@@ -180,3 +180,29 @@ def test_backtest_invalid_date_range_returns_422(client: TestClient) -> None:
         },
     )
     assert response.status_code == 422
+
+
+def test_backtest_accepts_naive_datetime_without_crashing(client: TestClient) -> None:
+    """
+    Regressão: o GPT manda datas sem timezone (ex.: "2026-07-01T00:00:00",
+    sem "Z"/offset) -- payload real reportado em produção. Sem normalizar
+    para UTC, isso comparava datetime naive com Candle.open_time (sempre
+    UTC-aware) e estourava TypeError não tratado -> HTTP 500 genérico em
+    vez de um erro claro (ou, como aqui, um resultado válido).
+    """
+    response = client.post(
+        "/backtest",
+        json={
+            "symbol": "SOLUSDT",
+            "timeframe": "1H",
+            "start": "2026-01-05T00:00:00",  # sem timezone -- exatamente o payload que quebrava
+            "end": "2026-01-15T00:00:00",
+            "strategy": "sma_cross",
+            "cost_model": {"spread_bps": 0, "slippage_bps": 0, "commission_bps": 0},
+            "min_candles": 50,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    # a data naive deve ter sido normalizada para UTC, não descartada.
+    assert data["meta"]["requested_range"][0] == "2026-01-05T00:00:00+00:00"
