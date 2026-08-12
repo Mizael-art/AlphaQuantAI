@@ -68,6 +68,35 @@ class FlexibleJSONResponse(Response):
         return json.dumps(content, ensure_ascii=False, default=str).encode("utf-8")
 
 
+# Endpoints que usam FlexibleJSONResponse não têm um shape fixo -- por
+# isso não declaram `response_model`. Sem isso, o FastAPI não consegue
+# inferir o schema OpenAPI da resposta e cai em `{"type": "string"}`
+# (trata como corpo opaco). O validador de schema do ChatGPT Actions
+# aceita objeto livre, mas exige a chave `properties` presente mesmo
+# quando vazia -- só `additionalProperties: true` sozinho é rejeitado
+# ("object schema missing properties"). Este override documenta
+# corretamente "isto é um objeto JSON, com campos variáveis" nos 4
+# endpoints de payload dinâmico.
+_FREEFORM_JSON_OBJECT_RESPONSES: dict[int | str, dict] = {
+    200: {
+        "description": "Successful Response",
+        "content": {
+            "application/json": {
+                "schema": {"type": "object", "properties": {}, "additionalProperties": True}
+            }
+        },
+    }
+}
+
+
+class HealthResponse(BaseModel):
+    status: str
+
+
+class BacktestStrategiesResponse(BaseModel):
+    strategies: list[str]
+
+
 app = FastAPI(
     title="AlphaQuant Engine",
     description=(
@@ -77,18 +106,18 @@ app = FastAPI(
         "derivativos e consenso multi-exchange (preço e estrutura), "
         "consumidos sem depender de prints de gráfico."
     ),
-    version="2.6",
+    version="3.1",
     servers=[{"url": "https://alphaquantai-1.onrender.com", "description": "Produção (Render)"}],
 )
 
 
-@app.get("/health")
-def health() -> dict:
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
     """Health check simples -- não toca em nenhuma API externa."""
-    return {"status": "ok"}
+    return HealthResponse(status="ok")
 
 
-@app.get("/snapshot", response_class=FlexibleJSONResponse)
+@app.get("/snapshot", response_class=FlexibleJSONResponse, responses=_FREEFORM_JSON_OBJECT_RESPONSES)
 def get_snapshot(
     symbol: str = Query(default=DEFAULT_SYMBOL, description="Par de negociação, ex.: ETHUSDT."),
     timeframes: str = Query(
@@ -111,7 +140,7 @@ def get_snapshot(
     return result.to_dict()
 
 
-@app.get("/analyze", response_class=FlexibleJSONResponse)
+@app.get("/analyze", response_class=FlexibleJSONResponse, responses=_FREEFORM_JSON_OBJECT_RESPONSES)
 def get_analyze(
     symbol: str = Query(default=DEFAULT_SYMBOL, description="Par de negociação, ex.: ETHUSDT."),
     timeframe: str = Query(default=DEFAULT_TIMEFRAME, description="Timeframe único, ex.: 4H."),
@@ -127,7 +156,7 @@ def get_analyze(
     return result.to_dict()
 
 
-@app.get("/scan", response_class=FlexibleJSONResponse)
+@app.get("/scan", response_class=FlexibleJSONResponse, responses=_FREEFORM_JSON_OBJECT_RESPONSES)
 def get_scan(
     symbols: str | None = Query(
         default=None,
@@ -182,13 +211,13 @@ class BacktestRequest(BaseModel):
     min_candles: int = Field(default=50, description="Mínimo de candles exigido no range -- abaixo disso, erro em vez de rodar com amostra insuficiente.")
 
 
-@app.get("/backtest/strategies")
-def get_backtest_strategies() -> dict:
+@app.get("/backtest/strategies", response_model=BacktestStrategiesResponse)
+def get_backtest_strategies() -> BacktestStrategiesResponse:
     """Lista as estratégias registradas e utilizáveis no campo `strategy` de POST /backtest."""
-    return {"strategies": available_strategies()}
+    return BacktestStrategiesResponse(strategies=available_strategies())
 
 
-@app.post("/backtest", response_class=FlexibleJSONResponse)
+@app.post("/backtest", response_class=FlexibleJSONResponse, responses=_FREEFORM_JSON_OBJECT_RESPONSES)
 def post_backtest(request: BacktestRequest) -> dict:
     """Roda backtest bar-a-bar (sem lookahead) de uma estratégia registrada sobre histórico real. Retorna performance (win rate, R médio, profit factor, drawdown) e trades. Erros de dados voltam como HTTP 422 com o motivo, nunca resultado parcial."""
     try:
