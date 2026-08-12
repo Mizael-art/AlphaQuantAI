@@ -106,7 +106,7 @@ app = FastAPI(
         "derivativos e consenso multi-exchange (preço e estrutura), "
         "consumidos sem depender de prints de gráfico."
     ),
-    version="3.2",
+    version="3.3",
     servers=[{"url": "https://alphaquantai-1.onrender.com", "description": "Produção (Render)"}],
 )
 

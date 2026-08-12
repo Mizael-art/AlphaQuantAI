@@ -192,10 +192,7 @@ DEBUG_MODE: Final[bool] = True
 # Ajuste livremente conforme o que você realmente acompanha.
 DEFAULT_SCAN_SYMBOLS: Final[list[str]] = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "TONUSDT",
-    "TRXUSDT", "DOTUSDT", "MATICUSDT", "LTCUSDT", "SUIUSDT",
-    "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "ATOMUSDT",
-    "INJUSDT", "FILUSDT", "RENDERUSDT", "TIAUSDT", "HBARUSDT",
+    "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
 ]
 
 # Timeframes padrão do scan: HTF (contexto/tendência) e LTF (gatilho).
