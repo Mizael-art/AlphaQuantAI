@@ -5,6 +5,12 @@
     "description": "Backend de dados de mercado (Spot + Futures + multi-exchange) para o AlphaQuant X: indicadores técnicos, estrutura de mercado, Smart Money Concepts, Volume Profile, estatística, derivativos e consenso multi-exchange (preço e estrutura), consumidos sem depender de prints de gráfico.",
     "version": "2.6"
   },
+  "servers": [
+    {
+      "url": "https://alphaquantai-1.onrender.com",
+      "description": "Produção (Render)"
+    }
+  ],
   "paths": {
     "/health": {
       "get": {
@@ -246,7 +252,7 @@
     "/backtest": {
       "post": {
         "summary": "Post Backtest",
-        "description": "Roda um backtest bar-a-bar (sem lookahead -- ver `backtest/simulator.py`)\nde uma estratégia registrada sobre o histórico real de `symbol`/`timeframe`.\n\nFluxo: HistoryFetcher (pagina candles reais via ProviderRouter) ->\nBacktestSimulator (executa a estratégia candle a candle) ->\ncalculate_performance (agrega os trades em métricas).\n\nErros de dados (símbolo não suportado, histórico insuficiente,\nrange inválido) retornam HTTP 422 com o motivo -- nunca um\nresultado parcial ou fabricado.",
+        "description": "Roda backtest bar-a-bar (sem lookahead) de uma estratégia registrada sobre histórico real. Retorna performance (win rate, R médio, profit factor, drawdown) e trades. Erros de dados voltam como HTTP 422 com o motivo, nunca resultado parcial.",
         "operationId": "post_backtest_backtest_post",
         "requestBody": {
           "content": {
