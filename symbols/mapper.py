@@ -100,6 +100,41 @@ def _strip_slash(raw: str) -> str:
     return raw.replace("/", "").replace("-", "").replace("_", "")
 
 
+# Sufixos de notação do TradingView que indicam o TIPO de contrato, não
+# um ativo diferente. Na API real das exchanges (ex.: Bybit V5), essa
+# distinção é feita por parâmetro (`category=linear` vs. `category=spot`),
+# nunca por sufixo no símbolo -- "CLUSDT.P" no gráfico do TradingView e
+# "CLUSDT" na API da Bybit (category=linear) são o MESMO ativo. Remover
+# aqui evita que qualquer símbolo colado direto de um gráfico do
+# TradingView (o fluxo mais comum de uso real) seja rejeitado como
+# "não reconhecido".
+_TRADINGVIEW_CONTRACT_SUFFIXES: tuple[str, ...] = (".P",)
+
+
+def _normalize_raw(raw_symbol: str) -> str:
+    """
+    Normaliza um símbolo bruto (usuário, TradingView, webhook) antes de
+    resolvê-lo: maiúsculas, sem espaços, sem prefixo de exchange
+    ('BYBIT:CLUSDT.P' -> 'CLUSDT.P'), sem separadores ('BTC/USDT' ->
+    'BTCUSDT') e sem sufixo de tipo de contrato do TradingView
+    ('CLUSDT.P' -> 'CLUSDT').
+    """
+    text = raw_symbol.strip().upper()
+
+    # Prefixo de exchange no formato TradingView: "BYBIT:CLUSDT.P".
+    if ":" in text:
+        text = text.split(":", 1)[1]
+
+    text = _strip_slash(text)
+
+    for suffix in _TRADINGVIEW_CONTRACT_SUFFIXES:
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+
+    return text
+
+
 class SymbolMapper:
     """
     Normaliza símbolos vindos de qualquer origem (usuário, webhook,
@@ -120,7 +155,7 @@ class SymbolMapper:
         if not raw_symbol or not raw_symbol.strip():
             raise SymbolNotRecognizedError("Símbolo vazio.")
 
-        cleaned = _strip_slash(raw_symbol.strip().upper())
+        cleaned = _normalize_raw(raw_symbol)
 
         # 1) Alias explícito (TradFi principalmente).
         if cleaned in _ALIASES:

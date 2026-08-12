@@ -1,31 +1,27 @@
 """
 analysis/score.py
-===================
+====================
 
-Cálculo do score final da análise (0-100), combinando os principais
-sinais gerados pelo restante do pipeline:
+Score técnico (0-100): "quanto o setup parece bom", combinando
+tendência, momentum (RSI/MACD), confirmação estrutural (BOS/CHOCH) e
+volume.
 
-- Tendência (EMA + estrutura)
-- Momentum (RSI, MACD)
-- Estrutura de mercado (BOS/CHOCH)
-- Volume (acima/abaixo da média)
-
-O score representa o grau de confluência entre os sinais na direção
-da tendência identificada: quanto mais sinais concordam com a
-tendência, mais alto o score. Valores próximos de 50 indicam mercado
-neutro/indeciso.
+IMPORTANTE (Documento 4, seção 13): este é o SCORE TÉCNICO, não a
+CONFIANÇA. Este número não sabe nada sobre quantas exchanges
+confirmam o dado -- essa é outra dimensão (`cross_exchange` /
+`data_confidence`), calculada em outro lugar e combinada com este
+score fora deste módulo. Um score alto aqui NUNCA deve ser lido, por
+si só, como "pode entrar".
 """
 
 from __future__ import annotations
 
-
-def _trend_direction(trend: str) -> int:
-    """Converte a tendência textual em um multiplicador direcional (+1/-1/0)."""
-    if trend == "Bullish":
-        return 1
-    if trend == "Bearish":
-        return -1
-    return 0
+# Pesos somam 100 -- cada componente contribui proporcionalmente à sua
+# importância relativa para a decisão técnica.
+_WEIGHT_TREND = 35
+_WEIGHT_MOMENTUM = 25
+_WEIGHT_STRUCTURE = 30
+_WEIGHT_VOLUME = 10
 
 
 def calculate_score(
@@ -37,54 +33,54 @@ def calculate_score(
     volume_above_average: bool,
 ) -> int:
     """
-    Calcula o score final (0-100) da análise.
-
-    A pontuação parte de uma base neutra de 50 e soma/subtrai pontos
-    conforme cada sinal confirma ou contraria a tendência vigente:
-
-    - RSI alinhado com a tendência (>50 em alta, <50 em baixa): +10
-    - MACD histogram alinhado com a tendência (positivo em alta,
-      negativo em baixa): +15
-    - BOS confirmado (continuação de tendência): +15
-    - CHOCH detectado (possível reversão): -20 (penaliza a confiança
-      na tendência atual, independentemente da direção)
-    - Volume acima da média: +10 (mais convicção no movimento atual)
+    Calcula o score técnico combinado.
 
     Args:
-        trend: "Bullish", "Bearish" ou "Ranging".
-        rsi: valor atual do RSI (0-100).
-        macd_histogram: valor atual do histograma do MACD.
-        bos: se houve Break of Structure na direção da tendência.
-        choch: se houve Change of Character (sinal de reversão).
-        volume_above_average: se o volume atual está acima da média.
+        trend: tendência final ("Bullish" | "Bearish" | "Ranging"),
+            já reconciliada entre EMAs e estrutura (`analysis.trend`).
+        rsi: RSI(14) atual.
+        macd_histogram: histograma MACD atual (positivo = momentum de
+            alta, negativo = momentum de baixa).
+        bos: houve Break of Structure na direção da tendência.
+        choch: houve Change of Character (sinal de possível reversão
+            -- penaliza o score, não soma).
+        volume_above_average: volume do último candle acima da média.
 
     Returns:
-        Score inteiro, limitado ao intervalo [0, 100].
+        Inteiro de 0 a 100.
     """
-    direction = _trend_direction(trend)
-    score = 50.0
+    score = 0.0
 
-    if direction != 0:
-        # RSI: em tendência de alta, RSI > 50 reforça o movimento;
-        # em tendência de baixa, RSI < 50 reforça o movimento.
-        rsi_aligned = (direction == 1 and rsi > 50) or (direction == -1 and rsi < 50)
-        score += 10 if rsi_aligned else -10
+    # --- Tendência: só pontua quando há direção definida. ---
+    if trend in ("Bullish", "Bearish"):
+        score += _WEIGHT_TREND
 
-        # MACD histogram: positivo reforça alta, negativo reforça baixa.
-        macd_aligned = (direction == 1 and macd_histogram > 0) or (
-            direction == -1 and macd_histogram < 0
-        )
-        score += 15 if macd_aligned else -15
+    # --- Momentum: RSI fora da zona neutra e alinhado à tendência,
+    #     MACD com histograma na mesma direção. ---
+    momentum_score = 0.0
+    if trend == "Bullish":
+        if rsi > 50:
+            momentum_score += _WEIGHT_MOMENTUM * 0.5
+        if macd_histogram > 0:
+            momentum_score += _WEIGHT_MOMENTUM * 0.5
+    elif trend == "Bearish":
+        if rsi < 50:
+            momentum_score += _WEIGHT_MOMENTUM * 0.5
+        if macd_histogram < 0:
+            momentum_score += _WEIGHT_MOMENTUM * 0.5
+    score += momentum_score
 
-        if bos:
-            score += 15
-
-        if volume_above_average:
-            score += 10
-
+    # --- Estrutura: BOS na direção da tendência confirma continuação;
+    #     CHOCH é um alerta de reversão e reduz a pontuação estrutural. ---
+    structure_score = 0.0
+    if bos and trend in ("Bullish", "Bearish"):
+        structure_score += _WEIGHT_STRUCTURE
     if choch:
-        # CHOCH é penalizado independentemente da tendência, pois
-        # representa uma ameaça à validade da tendência vigente.
-        score -= 20
+        structure_score = max(0.0, structure_score - _WEIGHT_STRUCTURE * 0.5)
+    score += structure_score
 
-    return int(max(0, min(100, round(score))))
+    # --- Volume: confirma convicção por trás do movimento. ---
+    if volume_above_average and trend in ("Bullish", "Bearish"):
+        score += _WEIGHT_VOLUME
+
+    return max(0, min(100, round(score)))

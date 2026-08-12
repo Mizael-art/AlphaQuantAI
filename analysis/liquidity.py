@@ -1,61 +1,66 @@
 """
 analysis/liquidity.py
-=======================
+========================
 
-Identificação simplificada de zonas de liquidez.
+Zonas de liquidez no sentido Smart Money Concepts: onde estão os stops
+"resting" que o mercado tende a caçar antes de reverter/continuar.
 
-Em Smart Money Concepts, "liquidez" refere-se a regiões de preço onde
-há concentração de ordens (stops de compradores/vendedores),
-tipicamente logo acima de swing highs recentes (liquidez de compra) e
-logo abaixo de swing lows recentes (liquidez de venda).
+- **buy_side**: liquidez ACIMA do preço -- stops de vendedores vendidos
+  e ordens de compra de breakout, acumulados logo acima de swing
+  highs. É "buy-side" porque um sweep ali dispara COMPRAS (stop-loss de
+  posições vendidas sendo estopadas).
+- **sell_side**: liquidez ABAIXO do preço -- stops de comprados e
+  ordens de venda de breakdown, acumulados logo abaixo de swing lows.
+  Um sweep ali dispara VENDAS.
 
-Esta implementação inicial marca essas zonas com base nos swing points
-já detectados — servindo de base para uma futura integração com dados
-de order book (profundidade) e Open Interest.
+Esta é uma leitura estrutural simples (swing highs/lows brutos), não o
+mesmo dado que `smc.liquidity_sweeps` e `smc.equal_highs_lows` (que já
+detectam eventos de varredura e igualdades de forma mais rigorosa) --
+aqui o objetivo é só mapear ONDE a liquidez plausivelmente está, para
+o campo `liquidity` do snapshot.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
+
+from config import ANALYSIS_CONFIG
 
 
 @dataclass(frozen=True, slots=True)
 class LiquidityZones:
-    """Zonas de liquidez estimadas a partir dos swing points recentes."""
+    """Zonas de liquidez identificadas, separadas por lado."""
 
-    buy_side: list[float]
-    sell_side: list[float]
+    buy_side: list[float] = field(default_factory=list)
+    sell_side: list[float] = field(default_factory=list)
 
 
-def find_liquidity_zones(swings: pd.DataFrame, max_zones: int = 3) -> LiquidityZones:
+def find_liquidity_zones(swings: pd.DataFrame) -> LiquidityZones:
     """
-    Estima zonas de liquidez de compra (acima dos swing highs) e de
-    venda (abaixo dos swing lows), usando os `max_zones` swings mais
-    recentes de cada tipo.
+    Deriva as zonas de liquidez a partir dos swing points.
 
     Args:
-        swings: DataFrame de swing points (colunas "price", "type"),
-            ordenado cronologicamente (saída de `structure.swings.get_swing_points`).
-        max_zones: número máximo de zonas retornadas por lado.
+        swings: saída de `structure.swings.get_swing_points` (colunas
+            "price", "type"), em ordem cronológica.
 
     Returns:
-        `LiquidityZones` com os níveis estimados de liquidez de compra
-        (buy_side) e de venda (sell_side).
+        `LiquidityZones` com os `ANALYSIS_CONFIG.max_levels_returned`
+        swing highs mais recentes (buy_side) e swing lows mais
+        recentes (sell_side).
     """
     if swings.empty:
-        return LiquidityZones(buy_side=[], sell_side=[])
+        return LiquidityZones()
 
-    recent_highs = swings.loc[swings["type"] == "high", "price"].tail(max_zones)
-    recent_lows = swings.loc[swings["type"] == "low", "price"].tail(max_zones)
+    max_levels = ANALYSIS_CONFIG.max_levels_returned
 
-    # Liquidez de compra: logo acima dos swing highs (onde ficam os
-    # stops de quem vendeu/shorteou o rompimento).
-    buy_side = [round(price, 6) for price in recent_highs.tolist()]
+    swing_highs = swings.loc[swings["type"] == "high", "price"]
+    swing_lows = swings.loc[swings["type"] == "low", "price"]
 
-    # Liquidez de venda: logo abaixo dos swing lows (onde ficam os
-    # stops de quem comprou/segurou o suporte).
-    sell_side = [round(price, 6) for price in recent_lows.tolist()]
+    # Mais recentes primeiro -- liquidez recente é mais relevante que
+    # um swing de meses atrás que o mercado já pode ter "limpado".
+    buy_side = [round(float(p), 6) for p in swing_highs.iloc[::-1].head(max_levels)]
+    sell_side = [round(float(p), 6) for p in swing_lows.iloc[::-1].head(max_levels)]
 
     return LiquidityZones(buy_side=buy_side, sell_side=sell_side)

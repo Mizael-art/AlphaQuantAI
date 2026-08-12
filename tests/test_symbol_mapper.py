@@ -76,3 +76,50 @@ def test_to_provider_symbol_uses_override_for_bybit_tradfi(mapper: SymbolMapper)
 def test_to_provider_symbol_defaults_to_canonical_when_no_override(mapper: SymbolMapper) -> None:
     assert mapper.to_provider_symbol("BTCUSDT", "bybit_crypto") == "BTCUSDT"
     assert mapper.to_provider_symbol("NAS100", "bybit_tradfi") == "NAS100"
+
+
+# ----------------------------------------------------------------------
+# Regressão: sufixo ".P" do TradingView (contrato perpétuo) e prefixo
+# de exchange ("BYBIT:") -- bug relatado pelo usuário com CLUSDT.P.
+#
+# Na API real (Bybit V5), "CLUSDT.P" no gráfico do TradingView e
+# "CLUSDT" via `category=linear` são o MESMO ativo -- o ".P" é só a
+# notação do TradingView para "isto é o perpétuo", não faz parte do
+# símbolo de nenhuma exchange.
+# ----------------------------------------------------------------------
+def test_tradingview_perpetual_suffix_is_stripped(mapper: SymbolMapper) -> None:
+    result = mapper.resolve("CLUSDT.P")
+    assert result.canonical_symbol == "CLUSDT"
+    assert result.asset_class == AssetClass.CRYPTO
+
+
+def test_tradingview_exchange_prefix_is_stripped(mapper: SymbolMapper) -> None:
+    result = mapper.resolve("BYBIT:CLUSDT.P")
+    assert result.canonical_symbol == "CLUSDT"
+    assert result.asset_class == AssetClass.CRYPTO
+
+
+def test_tradingview_prefix_and_suffix_case_insensitive(mapper: SymbolMapper) -> None:
+    result = mapper.resolve("bybit:clusdt.p")
+    assert result.canonical_symbol == "CLUSDT"
+
+
+@pytest.mark.parametrize(
+    "raw,expected_canonical",
+    [
+        ("BTCUSDT.P", "BTCUSDT"),
+        ("ETHUSDT.P", "ETHUSDT"),
+        ("BINANCE:SOLUSDT.P", "SOLUSDT"),
+    ],
+)
+def test_various_perpetual_symbols_resolve(mapper: SymbolMapper, raw: str, expected_canonical: str) -> None:
+    result = mapper.resolve(raw)
+    assert result.canonical_symbol == expected_canonical
+    assert result.asset_class == AssetClass.CRYPTO
+
+
+def test_tradfi_alias_with_perpetual_suffix_still_resolves(mapper: SymbolMapper) -> None:
+    """Ex.: 'NAS100.P' no TradingView -- deve cair no mesmo alias que 'NAS100'."""
+    result = mapper.resolve("NAS100.P")
+    assert result.canonical_symbol == "NAS100"
+    assert result.asset_class == AssetClass.INDEX

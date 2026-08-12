@@ -2,220 +2,242 @@
 server.py
 =========
 
-Expõe o AlphaQuant Engine como uma API HTTP (FastAPI), para que o
-AlphaQuant X (GPT personalizado) consiga consumir os dados via
-"Actions" — GPTs não executam código Python local, apenas chamam
-endpoints HTTPS que retornam JSON.
+API HTTP (FastAPI) do AlphaQuant Engine -- é isto que o AlphaQuant X
+(GPT customizado / outro consumidor) chama via Action/HTTP.
 
-Rodar localmente:
-    uvicorn server:app --reload --port 8000
+Endpoints:
+    GET /snapshot   -- Market Snapshot multi-timeframe completo
+                        (indicadores + estrutura + SMC + volume
+                        profile + estatística + derivativos +
+                        confluência + consenso multi-exchange).
+                        Este é o endpoint principal.
+    GET /analyze    -- análise de um único timeframe (compat. Fase 1).
+    GET /scan       -- varredura multi-símbolo (scanner/).
+    GET /health     -- health check.
+    GET /openapi.json -- schema OpenAPI (gerado automaticamente pelo
+                        FastAPI), usado para configurar a Action do GPT.
 
-Documentação automática (schema OpenAPI):
-    http://localhost:8000/docs        (Swagger UI, para testar manualmente)
-    http://localhost:8000/openapi.json (schema usado na Action do GPT)
+Nota de reconstrução: este arquivo veio vazio (0 bytes) no zip
+`AlphaQuantEngine_v2_6_structure_consensus`. Foi reconstruído a partir
+do README (seção "Uso") e das assinaturas reais de
+`snapshot.build_market_snapshot`, `app.run_analysis` e
+`scanner.scan_market` -- ver CHANGELOG_v2.6_rebuild.md.
 """
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
+from typing import Any
+
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
 
 from app import InsufficientDataError, run_analysis
+from backtest.costs import CostModel
+from backtest.history_fetcher import HistoryFetcher, HistoryFetchError
+from backtest.performance import calculate_performance
+from backtest.registry import StrategyNotRegisteredError, available_strategies, build_strategy
+from backtest.simulator import BacktestSimulator
 from config import (
-    DEFAULT_KLINES_LIMIT,
     DEFAULT_SCAN_HTF,
     DEFAULT_SCAN_LTF,
     DEFAULT_SCAN_SYMBOLS,
     DEFAULT_SYMBOL,
     DEFAULT_TIMEFRAME,
     SCAN_MAX_SYMBOLS,
-    TIMEFRAME_MAP,
 )
-from providers import DataUnavailableError
-from scanner import scan_market
-from snapshot import DEFAULT_TIMEFRAMES, build_market_snapshot
-from symbols import SymbolNotRecognizedError
+from providers import DataUnavailableError, build_default_router
+from scanner.screener import scan_market
+from snapshot.market_snapshot import DEFAULT_TIMEFRAMES, build_market_snapshot
 
 
-class FlexibleJSONResponse(BaseModel):
-    """Resposta com estrutura variável (indicadores, SMC, volume profile, derivativos)."""
+class FlexibleJSONResponse(Response):
+    """
+    Resposta JSON que não recorta o schema OpenAPI a um `response_model`
+    fixo (`additionalProperties: true` implícito) -- o payload varia
+    conforme timeframes/erros/consenso multi-exchange disponíveis, e
+    engessar um schema aqui obrigaria a reimportar a Action do GPT a
+    cada campo novo adicionado nos motores internos.
+    """
 
-    # Os payloads de /analyze e /snapshot têm estrutura profundamente
-    # aninhada e variável, então tipar cada campo em um schema Pydantic
-    # rígido seria frágil e exigiria reescrever o modelo a cada novo
-    # campo adicionado à análise. Este modelo permissivo (extra="allow",
-    # sem campos fixos) gera um schema OpenAPI com "properties": {} e
-    # "additionalProperties": true — o suficiente para o validador do
-    # ChatGPT Actions aceitar o schema (que exige a chave "properties"
-    # em todo objeto), enquanto deixa o payload real passar sem perdas.
-    model_config = ConfigDict(extra="allow")
+    media_type = "application/json"
 
-
-class HealthResponse(BaseModel):
-    """Resposta do health check."""
-
-    status: str
+    def render(self, content) -> bytes:  # noqa: ANN001 - assinatura herdada do Starlette.
+        return json.dumps(content, ensure_ascii=False, default=str).encode("utf-8")
 
 
 app = FastAPI(
-    title="AlphaQuant Engine API",
+    title="AlphaQuant Engine",
     description=(
-        "Fornece dados estruturados de mercado (indicadores + estrutura + SMC + "
-        "volume profile + derivativos + confluência multi-timeframe) para o "
-        "AlphaQuant X analisar automaticamente, sem necessidade de screenshots."
+        "Backend de dados de mercado (Spot + Futures + multi-exchange) "
+        "para o AlphaQuant X: indicadores técnicos, estrutura de "
+        "mercado, Smart Money Concepts, Volume Profile, estatística, "
+        "derivativos e consenso multi-exchange (preço e estrutura), "
+        "consumidos sem depender de prints de gráfico."
     ),
-    version="2.0.0",
-    # O schema OpenAPI gerado pelo FastAPI não sabe, por padrão, qual é o
-    # domínio público onde a API está hospedada — ele só descreve as rotas.
-    # As Actions do GPT EXIGEM um campo "servers" com uma URL absoluta no
-    # schema, senão rejeitam a importação com o erro "Não foi possível
-    # encontrar uma URL válida em servers". Ajuste esta URL para o domínio
-    # real do seu deploy (Render, etc.) sempre que ele mudar.
+    version="2.6",
     servers=[{"url": "https://alphaquantai-1.onrender.com", "description": "Produção (Render)"}],
 )
 
-# CORS liberado para qualquer origem: necessário porque a Action do GPT
-# chama o endpoint a partir dos servidores da OpenAI, não do navegador
-# do usuário — não há como restringir por domínio de forma útil aqui.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
+
+@app.get("/health")
+def health() -> dict:
+    """Health check simples -- não toca em nenhuma API externa."""
+    return {"status": "ok"}
 
 
-@app.get(
-    "/analyze",
-    summary="Gera a análise estruturada de um símbolo/timeframe (single-timeframe)",
-    response_model=FlexibleJSONResponse,
-)
-def analyze(
-    symbol: str = Query(DEFAULT_SYMBOL, description="Par de negociação, ex.: BTCUSDT, ETHUSDT"),
-    timeframe: str = Query(
-        DEFAULT_TIMEFRAME,
-        description=f"Timeframe. Valores aceitos: {list(TIMEFRAME_MAP.keys())}",
-    ),
-    limit: int = Query(
-        DEFAULT_KLINES_LIMIT, ge=200, le=1000, description="Quantidade de candles (200-1000)"
+@app.get("/snapshot", response_class=FlexibleJSONResponse)
+def get_snapshot(
+    symbol: str = Query(default=DEFAULT_SYMBOL, description="Par de negociação, ex.: ETHUSDT."),
+    timeframes: str = Query(
+        default=",".join(DEFAULT_TIMEFRAMES),
+        description="Timeframes separados por vírgula, ex.: 15m,1H,4H,1D.",
     ),
 ) -> dict:
-    """Endpoint de 1 timeframe: indicadores básicos + estrutura + score. Para análise completa, use /snapshot."""
+    """
+    Market Snapshot completo: indicadores, estrutura, SMC, volume
+    profile, estatística, derivativos, confluência multi-timeframe e
+    (quando habilitado em `config.ENABLE_CROSS_EXCHANGE`) consenso
+    multi-exchange de preço e estrutura. **Endpoint principal.**
+    """
+    tf_tuple = tuple(tf.strip() for tf in timeframes.split(",") if tf.strip())
     try:
-        result = run_analysis(symbol=symbol, timeframe=timeframe, limit=limit)
-    except SymbolNotRecognizedError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except DataUnavailableError as exc:
-        # Nenhum provider elegível (Bybit/Binance/TradFi) conseguiu
-        # fornecer dados válidos — nunca inventamos preço/candle.
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        result = build_market_snapshot(symbol=symbol, timeframes=tf_tuple)
+    except Exception as exc:  # noqa: BLE001 - erro de topo, reportado como HTTP 502.
+        raise HTTPException(status_code=502, detail=f"Falha ao gerar snapshot: {exc}") from exc
+
+    return result.to_dict()
+
+
+@app.get("/analyze", response_class=FlexibleJSONResponse)
+def get_analyze(
+    symbol: str = Query(default=DEFAULT_SYMBOL, description="Par de negociação, ex.: ETHUSDT."),
+    timeframe: str = Query(default=DEFAULT_TIMEFRAME, description="Timeframe único, ex.: 4H."),
+) -> dict:
+    """Análise de um único timeframe -- mantido por compatibilidade (escopo da Fase 1)."""
+    try:
+        result = run_analysis(symbol=symbol, timeframe=timeframe)
     except InsufficientDataError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001 - erro de topo não classificado.
-        raise HTTPException(status_code=502, detail=f"Falha ao consultar o provider de dados: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Falha ao gerar análise: {exc}") from exc
 
     return result.to_dict()
 
 
-@app.get(
-    "/snapshot",
-    summary="Gera o Market Snapshot completo (multi-timeframe + SMC + derivativos)",
-    response_model=FlexibleJSONResponse,
-)
-def snapshot(
-    symbol: str = Query(DEFAULT_SYMBOL, description="Par de negociação, ex.: BTCUSDT, ETHUSDT"),
-    timeframes: str = Query(
-        ",".join(DEFAULT_TIMEFRAMES),
-        description=(
-            "Lista de timeframes separados por vírgula, ex.: '15m,1H,4H,1D'. "
-            f"Valores aceitos: {list(TIMEFRAME_MAP.keys())}"
-        ),
+@app.get("/scan", response_class=FlexibleJSONResponse)
+def get_scan(
+    symbols: str | None = Query(
+        default=None,
+        description=f"Símbolos separados por vírgula (padrão: watchlist de {len(DEFAULT_SCAN_SYMBOLS)} ativos em config.DEFAULT_SCAN_SYMBOLS).",
     ),
+    htf: str = Query(default=DEFAULT_SCAN_HTF, description="Timeframe de contexto/tendência."),
+    ltf: str = Query(default=DEFAULT_SCAN_LTF, description="Timeframe de gatilho/execução."),
+    include_out_of_zone: bool = Query(default=False, description="Inclui também símbolos sem setup no retorno."),
 ) -> dict:
-    """Endpoint principal: indicadores, estrutura, SMC, volume profile, estatística, derivativos e confluência multi-timeframe em uma única chamada. Use este em vez de /analyze."""
-    requested_timeframes = tuple(tf.strip() for tf in timeframes.split(",") if tf.strip())
-
-    invalid = [tf for tf in requested_timeframes if tf not in TIMEFRAME_MAP]
-    if invalid:
+    """Varredura multi-símbolo pontual -- ver `scanner/screener.py` para a lógica de classificação."""
+    symbol_list = (
+        [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        if symbols
+        else DEFAULT_SCAN_SYMBOLS
+    )
+    if len(symbol_list) > SCAN_MAX_SYMBOLS:
         raise HTTPException(
-            status_code=400,
-            detail=f"Timeframes inválidos: {invalid}. Valores aceitos: {list(TIMEFRAME_MAP.keys())}",
+            status_code=422,
+            detail=f"Máximo de {SCAN_MAX_SYMBOLS} símbolos por chamada, {len(symbol_list)} recebidos.",
         )
 
-    try:
-        result = build_market_snapshot(symbol=symbol, timeframes=requested_timeframes)
-    except SymbolNotRecognizedError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except DataUnavailableError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001 - erro de topo não classificado.
-        raise HTTPException(status_code=502, detail=f"Falha ao consultar o provider de dados: {exc}") from exc
-
+    result = scan_market(symbol_list, htf=htf, ltf=ltf, include_out_of_zone=include_out_of_zone)
     return result.to_dict()
 
 
-@app.get(
-    "/scan",
-    summary="Varre vários símbolos e devolve os que estão em zona de entrada ou para observar",
-    response_model=FlexibleJSONResponse,
-)
-def scan(
-    symbols: str = Query(
-        "",
-        description=(
-            "Lista de símbolos separados por vírgula, ex.: 'BTCUSDT,ETHUSDT,SOLUSDT'. "
-            "Se vazio, usa a watchlist padrão do servidor (DEFAULT_SCAN_SYMBOLS)."
-        ),
-    ),
-    htf: str = Query(
-        DEFAULT_SCAN_HTF,
-        description=f"Timeframe de contexto/tendência. Valores aceitos: {list(TIMEFRAME_MAP.keys())}",
-    ),
-    ltf: str = Query(
-        DEFAULT_SCAN_LTF,
-        description=f"Timeframe de gatilho/execução. Valores aceitos: {list(TIMEFRAME_MAP.keys())}",
-    ),
-    include_out_of_zone: bool = Query(
-        False,
-        description="Se True, inclui também os símbolos sem setup no momento (payload maior).",
-    ),
-) -> dict:
-    """
-    Varredura multi-símbolo (screener). Roda a mesma análise do
-    `/analyze` em cada símbolo (timeframe HTF + LTF) e classifica cada
-    um em `entry_zone` (dentro da zona de entrada agora), `watch`
-    (aproximando-se / setup se formando) ou `out_of_zone` (sem
-    confluência — omitido por padrão).
+# ----------------------------------------------------------------------
+# Backtest
+# ----------------------------------------------------------------------
+# O motor de backtest (backtest/) já existia completo (HistoryFetcher,
+# BacktestSimulator, Strategy, calculate_performance) mas não tinha
+# NENHUM endpoint HTTP -- por isso o GPT não conseguia rodar backtest:
+# não havia como chamar isso via Action. Os dois endpoints abaixo
+# fecham esse buraco.
 
-    Use este endpoint quando o usuário pedir para "procurar
-    oportunidades", "varrer o mercado", "ver o que está perto de
-    entrada" etc., em vez de pedir análise de um símbolo específico.
-    """
-    requested = [s.strip().upper() for s in symbols.split(",") if s.strip()] or list(
-        DEFAULT_SCAN_SYMBOLS
+
+class BacktestCostModelRequest(BaseModel):
+    """Custos de execução (bps). Default é zero em cada campo -- ver `backtest/costs.py`: um backtest sem custo informado é reportado como resultado BRUTO, nunca com fricção "realista" inventada."""
+
+    spread_bps: float = 0.0
+    slippage_bps: float = 0.0
+    commission_bps: float = 0.0
+
+
+class BacktestRequest(BaseModel):
+    symbol: str = Field(description="Par de negociação, ex.: ETHUSDT. Aceita formato TradingView (ex.: 'BYBIT:ETHUSDT.P').")
+    timeframe: str = Field(description="Timeframe dos candles do backtest, ex.: 1H, 4H, 1D.")
+    start: datetime = Field(description="Início do range histórico (ISO 8601).")
+    end: datetime | None = Field(default=None, description="Fim do range histórico (padrão: agora).")
+    strategy: str = Field(default="sma_cross", description="Nome da estratégia registrada. Ver GET /backtest/strategies.")
+    strategy_params: dict[str, Any] = Field(default_factory=dict, description="Parâmetros da estratégia (ex.: {\"fast_period\": 10}).")
+    cost_model: BacktestCostModelRequest = Field(default_factory=BacktestCostModelRequest)
+    min_candles: int = Field(default=50, description="Mínimo de candles exigido no range -- abaixo disso, erro em vez de rodar com amostra insuficiente.")
+
+
+@app.get("/backtest/strategies")
+def get_backtest_strategies() -> dict:
+    """Lista as estratégias registradas e utilizáveis no campo `strategy` de POST /backtest."""
+    return {"strategies": available_strategies()}
+
+
+@app.post("/backtest", response_class=FlexibleJSONResponse)
+def post_backtest(request: BacktestRequest) -> dict:
+    """Roda backtest bar-a-bar (sem lookahead) de uma estratégia registrada sobre histórico real. Retorna performance (win rate, R médio, profit factor, drawdown) e trades. Erros de dados voltam como HTTP 422 com o motivo, nunca resultado parcial."""
+    try:
+        strategy = build_strategy(request.strategy, request.strategy_params)
+    except StrategyNotRegisteredError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    cost_model = CostModel(
+        spread_bps=request.cost_model.spread_bps,
+        slippage_bps=request.cost_model.slippage_bps,
+        commission_bps=request.cost_model.commission_bps,
     )
 
-    if len(requested) > SCAN_MAX_SYMBOLS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Máximo de {SCAN_MAX_SYMBOLS} símbolos por chamada, recebido {len(requested)}.",
+    fetcher = HistoryFetcher(router=build_default_router())
+    try:
+        history = fetcher.fetch(
+            symbol=request.symbol,
+            timeframe=request.timeframe,
+            start=request.start,
+            end=request.end,
+            min_candles=request.min_candles,
         )
+    except (HistoryFetchError, DataUnavailableError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    for tf in (htf, ltf):
-        if tf not in TIMEFRAME_MAP:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Timeframe inválido: {tf}. Valores aceitos: {list(TIMEFRAME_MAP.keys())}",
-            )
+    simulator = BacktestSimulator(strategy=strategy, cost_model=cost_model)
+    try:
+        trades = simulator.run(history.candles)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    result = scan_market(symbols=requested, htf=htf, ltf=ltf, include_out_of_zone=include_out_of_zone)
-    return result.to_dict()
+    performance = calculate_performance(trades) if trades else None
 
-
-@app.get("/health", summary="Verifica se a API está no ar", response_model=HealthResponse)
-def health() -> dict:
-    """Endpoint simples de health check, útil para o provedor de deploy."""
-    return {"status": "ok"}
+    return {
+        "meta": history.to_meta_dict(),
+        "strategy": {"name": strategy.name, "params": request.strategy_params},
+        "cost_model": {
+            "is_zero_cost": cost_model.is_zero_cost,
+            "spread_bps": cost_model.spread_bps,
+            "slippage_bps": cost_model.slippage_bps,
+            "commission_bps": cost_model.commission_bps,
+        },
+        "trades_count": len(trades),
+        "rejected_signals_count": len(simulator.rejected_signals),
+        "performance": performance.to_dict() if performance is not None else None,
+        "performance_note": (
+            None
+            if performance is not None
+            else "A estratégia não gerou nenhum trade válido no período -- sem base para métricas de performance."
+        ),
+        "trades": [t.to_dict() for t in trades],
+    }

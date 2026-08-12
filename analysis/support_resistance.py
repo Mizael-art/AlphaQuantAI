@@ -1,10 +1,20 @@
 """
 analysis/support_resistance.py
-================================
+=================================
 
-Identifica níveis de suporte e resistência a partir dos swing points,
-agrupando (clusterizando) níveis de preço próximos entre si em uma
-única zona — evitando retornar dezenas de níveis quase idênticos.
+Deriva níveis de suporte e resistência a partir dos swing points
+(`structure.swings.get_swing_points`) mais próximos do preço atual.
+
+Abordagem:
+
+1. Swing highs acima do preço atual -> candidatos a resistência.
+   Swing lows abaixo do preço atual -> candidatos a suporte.
+2. Níveis muito próximos entre si (dentro de
+   `ANALYSIS_CONFIG.price_cluster_tolerance_pct`) são agrupados em uma
+   única zona (usa a média do cluster) -- evita listar 3 resistências
+   que na prática são a mesma zona.
+3. Retorna os `ANALYSIS_CONFIG.max_levels_returned` níveis mais
+   próximos do preço atual, em cada lado.
 """
 
 from __future__ import annotations
@@ -17,70 +27,66 @@ from config import ANALYSIS_CONFIG
 def _cluster_levels(levels: list[float], tolerance_pct: float) -> list[float]:
     """
     Agrupa níveis de preço próximos (dentro de `tolerance_pct`) em uma
-    única zona, representada pela média dos níveis do cluster.
+    única zona (média do cluster). `levels` deve vir ordenado.
     """
     if not levels:
         return []
 
-    sorted_levels = sorted(levels)
-    clusters: list[list[float]] = [[sorted_levels[0]]]
-
-    for level in sorted_levels[1:]:
-        last_cluster_avg = sum(clusters[-1]) / len(clusters[-1])
-        distance_pct = abs(level - last_cluster_avg) / last_cluster_avg * 100
-
+    clusters: list[list[float]] = [[levels[0]]]
+    for level in levels[1:]:
+        cluster_avg = sum(clusters[-1]) / len(clusters[-1])
+        if cluster_avg == 0:
+            clusters.append([level])
+            continue
+        distance_pct = abs(level - cluster_avg) / abs(cluster_avg) * 100
         if distance_pct <= tolerance_pct:
             clusters[-1].append(level)
         else:
             clusters.append([level])
 
-    return [round(sum(cluster) / len(cluster), 6) for cluster in clusters]
+    return [sum(cluster) / len(cluster) for cluster in clusters]
 
 
 def find_support_resistance(
     df: pd.DataFrame,
     swings: pd.DataFrame,
     current_price: float,
-    max_levels: int | None = None,
-    tolerance_pct: float | None = None,
 ) -> tuple[list[float], list[float]]:
     """
-    Deriva níveis de suporte e resistência a partir dos swing points.
+    Encontra os níveis de suporte e resistência mais relevantes.
 
     Args:
-        df: DataFrame OHLCV (usado apenas como referência, hoje não é
-            estritamente necessário mas mantido para futura expansão,
-            ex.: considerar volume por nível).
-        swings: DataFrame de swing points (colunas "price", "type").
-        current_price: preço atual do ativo, usado para separar níveis
-            abaixo (suporte) e acima (resistência) do preço.
-        max_levels: quantidade máxima de níveis retornados por lado
-            (padrão: `config.ANALYSIS_CONFIG.max_levels_returned`).
-        tolerance_pct: tolerância percentual para clusterizar níveis
-            próximos (padrão: `config.ANALYSIS_CONFIG.price_cluster_tolerance_pct`).
+        df: DataFrame OHLCV (não usado diretamente hoje -- mantido na
+            assinatura para permitir refinamentos futuros, ex.: peso
+            por volume no nível, sem quebrar quem já chama esta
+            função. `swings` já carrega tudo que é necessário).
+        swings: saída de `structure.swings.get_swing_points` (colunas
+            "price", "type").
+        current_price: preço atual do ativo.
 
     Returns:
-        Tupla (support, resistance), cada uma como lista de floats,
-        ordenadas por proximidade ao preço atual.
+        Tupla `(support, resistance)`, cada uma uma lista de até
+        `ANALYSIS_CONFIG.max_levels_returned` níveis de preço,
+        ordenados do mais próximo ao mais distante do preço atual.
     """
-    max_levels = max_levels or ANALYSIS_CONFIG.max_levels_returned
-    tolerance_pct = tolerance_pct or ANALYSIS_CONFIG.price_cluster_tolerance_pct
-
     if swings.empty:
         return [], []
 
-    below_price = swings.loc[swings["price"] < current_price, "price"].tolist()
-    above_price = swings.loc[swings["price"] > current_price, "price"].tolist()
+    swing_highs = swings.loc[swings["type"] == "high", "price"]
+    swing_lows = swings.loc[swings["type"] == "low", "price"]
 
-    support_levels = _cluster_levels(below_price, tolerance_pct)
-    resistance_levels = _cluster_levels(above_price, tolerance_pct)
+    resistance_candidates = sorted(float(p) for p in swing_highs if p > current_price)
+    support_candidates = sorted((float(p) for p in swing_lows if p < current_price), reverse=True)
 
-    # Suporte: níveis mais próximos do preço atual primeiro (do maior
-    # para o menor, já que estão abaixo do preço).
-    support_levels = sorted(support_levels, reverse=True)[:max_levels]
+    tolerance = ANALYSIS_CONFIG.price_cluster_tolerance_pct
+    max_levels = ANALYSIS_CONFIG.max_levels_returned
 
-    # Resistência: níveis mais próximos do preço atual primeiro (do
-    # menor para o maior, já que estão acima do preço).
-    resistance_levels = sorted(resistance_levels)[:max_levels]
+    # Cluster preserva ordem de proximidade: resistance sobe a partir do
+    # preço (ordenado asc), support desce a partir do preço (ordenado desc).
+    resistance = _cluster_levels(resistance_candidates, tolerance)[:max_levels]
+    support = _cluster_levels(support_candidates, tolerance)[:max_levels]
 
-    return support_levels, resistance_levels
+    return (
+        [round(level, 6) for level in support],
+        [round(level, 6) for level in resistance],
+    )

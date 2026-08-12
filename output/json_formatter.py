@@ -1,30 +1,29 @@
-"""JSON serialization helpers for command-line analysis results."""
+"""
+output/json_formatter.py
+===========================
+
+Serializa `AnalysisResult` (ver `models.analysis_result`) para uma
+string JSON padronizada -- usado pelo CLI (`app.py`) e disponível para
+qualquer outro consumidor que precise do mesmo formato fora do
+`/analyze` HTTP.
+"""
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, is_dataclass
-from typing import Any
+
+from models.analysis_result import AnalysisResult
 
 
-def _to_json_compatible(value: Any) -> Any:
-    """Convert project result objects to values accepted by ``json.dumps``.
-
-    Result models expose ``to_dict``; the remaining fallbacks make the helper
-    safe for dataclasses and scalar types returned by numerical libraries.
+def to_json_string(result: AnalysisResult, *, indent: int = 2) -> str:
     """
-    if hasattr(value, "to_dict"):
-        return value.to_dict()
-    if is_dataclass(value):
-        return asdict(value)
-    if hasattr(value, "item"):
-        return value.item()
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+    Converte um `AnalysisResult` em JSON pronto para impressão/envio.
 
+    Args:
+        result: resultado da análise (`app.run_analysis`).
+        indent: indentação do JSON (padrão: 2, legível no CLI).
 
-def to_json_string(result: Any) -> str:
-    """Serialize an analysis result as readable UTF-8 JSON."""
-    payload = result.to_dict() if hasattr(result, "to_dict") else result
-    return json.dumps(payload, ensure_ascii=False, indent=2, default=_to_json_compatible)
+    Returns:
+        String JSON, UTF-8, sem escapar acentos (`ensure_ascii=False`).
+    """
+    return json.dumps(result.to_dict(), indent=indent, ensure_ascii=False)
